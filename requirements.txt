@@ -1,0 +1,23 @@
+# Уши (STT) — бесплатный онлайн-распознаватель Google через SpeechRecognition
+SpeechRecognition
+# Рот (TTS) — нейросетевые голоса Microsoft Edge (бесплатно, без ключа)
+edge-tts
+# Рот (TTS) — офлайн-запас на случай отсутствия интернета (Windows SAPI)
+pyttsx3
+# Микрофон и воспроизведение
+sounddevice
+# Декодирование mp3 в сырые сэмплы
+miniaudio
+numpy
+# Мозг (LLM) — SDK совместим с DeepSeek API
+openai
+python-dotenv
+
+# --- Инструменты: доступ в интернет ---
+# Поиск без ключа (DuckDuckGo)
+ddgs
+# Разбор HTML в читаемый текст
+beautifulsoup4
+lxml
+# Системные сертификаты Windows: без этого Python не доверяет сайтам
+truststore
