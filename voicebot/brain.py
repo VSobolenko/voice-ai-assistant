@@ -155,6 +155,9 @@ class Brain:
                     # иначе в метрику попадёт ещё и время ответа модели
                     yield ("tool_time", f"{time.perf_counter() - tool_started:.1f}")
                     print(indent_block(f"[результат] {result}"))
+                    # Имя инструмента и результат отдаём наружу: ассистенту нужно
+                    # знать, что именно искать, если человек скажет «скопируй результат».
+                    yield ("tool_result", (call["name"], result))
                 self.history.append({"role": "tool", "tool_call_id": call["id"], "content": result})
 
         if spoken:
@@ -198,6 +201,22 @@ class Brain:
     def reset(self) -> None:
         """Начать разговор заново (сбрасывает и историю, и системную инструкцию)."""
         self.history = [{"role": "system", "content": settings.system_prompt}]
+
+    def transcript(self) -> str:
+        """Разговор в виде текста: что спрашивали и что отвечали.
+
+        Служебные сообщения (системная инструкция, вызовы инструментов и их
+        результаты) пропускаем: человеку нужен разговор, а не протокол обмена.
+        """
+        lines: list[str] = []
+        for message in self.history:
+            role = message.get("role")
+            content = (message.get("content") or "").strip()
+            if role == "user" and content:
+                lines.append(f"Ты: {content}")
+            elif role == "assistant" and content:
+                lines.append(f"Бот: {content}")
+        return "\n".join(lines)
 
     def ping(self) -> str:
         """Быстрая проверка, что ключ и сеть работают."""

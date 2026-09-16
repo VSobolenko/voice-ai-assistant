@@ -7,16 +7,39 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 
-from . import audio, tools
+from . import audio, clipboard, tools
 from .brain import Brain, BrainError
 from .config import settings
 from .ears import SttError, transcribe
 from .mouth import Mouth, pop_sentences
 
-EXIT_WORDS = {"пока", "выход", "выход!", "стоп", "до свидания", "хватит", "закройся", "quit", "exit"}
+EXIT_WORDS = {
+    "пока", "выход", "выход!", "стоп", "до свидания", "хватит", "закройся", "quit", "exit",
+}
+
+# Адрес страницы в тексте: и в выдаче поиска, и в «Содержимое <url>:» от web_fetch
+URL = re.compile(r"https?://\S+")
+# Знаки, которые могут прилипнуть к ссылке справа: «Содержимое https://cbr.ru/…/:»
+URL_TAIL = ":.,;!?»)]}"
+
+
+def first_address(text: str) -> str:
+    """Первый адрес в тексте — без знаков препинания, прилипших к нему справа.
+
+    Двоеточие тут не придирка: в строке «Содержимое https://cbr.ru/…:» оно стоит
+    вплотную к ссылке, и без чистки в буфер уезжал бы адрес с хвостом из одного
+    символа — по такой ссылке браузер уже не откроет страницу.
+    """
+    for raw in URL.findall(text):
+        address = raw.rstrip(URL_TAIL)
+        if address:
+            return address
+    return ""
+
 
 GREETING = "Привет! Я голосовой ассистент. Задай любой вопрос голосом, и я отвечу."
 
@@ -25,6 +48,11 @@ class VoiceAssistant:
     def __init__(self) -> None:
         self.brain = Brain()
         self.mouth = Mouth()
+        # Что можно потом скопировать по просьбе «скопируй это». Здесь именно
+        # произнесённый текст, а не ответ модели: вслух и в буфер попадает одно и то же.
+        self.last_answer = ""
+        self.last_search = ""
+        self.last_address = ""
         # Прогрев запускаем сразу: первый запрос к модели в новом процессе
         # стоит около 10 секунд, и это время лучше потратить пока бот здоровается.
         self._warmup_thread: threading.Thread | None = self._start_warmup()
@@ -97,6 +125,13 @@ class VoiceAssistant:
                         tool_seconds += float(payload)
                         continue
 
+                    if kind == "tool_result":
+                        # Имя инструмента здесь не нужно: и выдача поиска, и текст
+                        # прочитанной страницы — это «то, что нашли».
+                        _, result = payload
+                        self._remember_result(result)
+                        continue
+
                     print(payload, end="", flush=True)
                     buffer += payload
                     tail_parts.append(payload)
@@ -135,7 +170,57 @@ class VoiceAssistant:
                 f"[задержка] первый звук {first_audio:.1f} с, ответ целиком {total:.1f} с"
                 f"{detail}; реплик озвучено: {phrases}"
             )
-        return " ".join(spoken)
+        result = " ".join(spoken)
+        if result.strip():
+            # Запоминаем именно то, что услышал человек: это и уйдёт в буфер.
+            self.last_answer = result
+        return result
+
+    # ------------------------------------------------------------------
+    # Служебные реплики: ассистент выполняет их сам, без модели
+    # ------------------------------------------------------------------
+    def _remember_result(self, result: str) -> None:
+        """Запомнить, что нашли, — чтобы потом ответить на «скопируй результат»."""
+        self.last_search = result
+        address = first_address(result)
+        if address:
+            # Первая ссылка в выдаче — обычно та, по которой стоит вернуться.
+            self.last_address = address
+
+    def copy_command(self, text: str) -> bool:
+        """Выполнить команду копирования, если человек её произнёс.
+
+        Возвращает True, если реплика обработана и в модель идти уже не нужно.
+        Копирование делает сам ассистент: он единственный держит текст ровно в том
+        виде, в каком тот прозвучал, и ему для этого не нужен ни ключ, ни сеть.
+        В историю разговора команда не попадает — модели нечего на неё отвечать.
+        """
+        if not clipboard.wants_copy(text):
+            return False
+
+        kind = clipboard.target(text)
+        content = {
+            clipboard.ANSWER: self.last_answer,
+            clipboard.SEARCH: self.last_search,
+            clipboard.ADDRESS: self.last_address,
+            clipboard.JOURNAL: self.brain.transcript(),
+        }[kind]
+
+        print(f"[буфер] копирую: {clipboard.TARGET_NAMES[kind]}")
+        if not content.strip():
+            print("[буфер] копировать нечего")
+            self.mouth.say("Пока нечего копировать.")
+            return True
+        try:
+            clipboard.copy(content)
+        except clipboard.ClipboardError as exc:
+            print(f"[буфер] не получилось: {exc}")
+            self.mouth.say("Не получилось скопировать.")
+            return True
+
+        print(f"[буфер] готово, {len(content)} символов")
+        self.mouth.say("Скопировал.")
+        return True
 
     # ------------------------------------------------------------------
     # Режим 1: разговор голосом (бесконечный цикл)
@@ -159,7 +244,7 @@ class VoiceAssistant:
                     continue
 
                 try:
-                    text = transcribe(pcm)
+                    text = transcribe(pcm, settings.stt_language)
                 except SttError as exc:
                     print(f"\n[уши] {exc}\n")
                     continue
@@ -173,6 +258,10 @@ class VoiceAssistant:
                     self.mouth.say("Пока! Хорошего дня.")
                     print("[бот] завершаю работу.")
                     return
+
+                if self.copy_command(text):
+                    audio.cooldown()
+                    continue
 
                 self.answer(text)
                 audio.cooldown()
@@ -201,6 +290,8 @@ class VoiceAssistant:
             if text.lower() in EXIT_WORDS:
                 self.mouth.say("Пока!")
                 return
+            if self.copy_command(text):
+                continue
             self.answer(text)
 
 
@@ -214,7 +305,12 @@ def self_test(tools_only: bool = False) -> int:
         print("[1/5] настройки (меняются в файле .env)")
         print(f"      модель      : {settings.model} @ {settings.base_url}")
         print(f"      уши (STT)   : {settings.stt_backend} / {settings.stt_language}")
-        print(f"      рот (TTS)   : {settings.tts_backend} / {settings.tts_voice}")
+        print(f"      рот (TTS)   : {settings.tts_backend}")
+        print(f"      голос RU    : {settings.tts_voice}")
+        print(f"      голос EN    : {settings.tts_voice_en}")
+        if settings.tts_voice == settings.tts_voice_en:
+            print("      ВНИМАНИЕ    : голоса совпадают — английский будет читаться")
+            print("                    русским голосом (или наоборот), это и есть «акцент»")
         print(f"      режим ввода : {settings.input_mode}")
         state = "включены" if settings.enable_tools else "выключены (ENABLE_TOOLS=0)"
         budget = f", бюджет {settings.tool_budget_seconds:.0f} с" if settings.enable_tools else ""
@@ -228,10 +324,21 @@ def self_test(tools_only: bool = False) -> int:
             print(f"      звук        : недоступен ({type(exc).__name__}: {exc})")
 
         print("[2/5] синтез речи (mp3 -> динамики)")
-        phrase = "Раз, два, три. Проверка голоса."
-        audio.beep()
-        Mouth().say(phrase)
-        print("      ок, вы должны были услышать фразу")
+        # Два голоса, а не один: английский текст должен звучать английским
+        # голосом, иначе получится тот самый «русский акцент».
+        checks = [
+            ("по-русски", "Раз, два, три. Проверка русского голоса.", settings.tts_voice),
+            ("по-английски", "Hello! This is the English voice. Nice to meet you.", settings.tts_voice_en),
+        ]
+        mouth = Mouth()
+        for title, phrase, voice in checks:
+            print(f"      {title}: {voice}")
+            audio.beep()
+            mouth.say(phrase)
+        if settings.tts_voice == settings.tts_voice_en:
+            print("      ок, обе фразы прозвучали одним и тем же (многоязычным) голосом")
+        else:
+            print("      ок, вы должны были услышать две фразы разными голосами")
 
         print("[3/5] распознавание речи (mp3 -> текст, микрофон не нужен)")
         try:
@@ -239,6 +346,10 @@ def self_test(tools_only: bool = False) -> int:
 
             import edge_tts
             import miniaudio
+
+            # Для распознавания берём русскую фразу: язык распознавания задан
+            # в STT_LANGUAGE, и проверяем именно его.
+            phrase = "Раз, два, три. Проверка распознавания речи."
 
             async def synth() -> bytes:
                 communicate = edge_tts.Communicate(phrase, settings.tts_voice)

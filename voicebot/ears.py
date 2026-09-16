@@ -30,13 +30,13 @@ class SttError(RuntimeError):
 # ---------------------------------------------------------------------------
 # Google — бесплатно, без ключа, нужен интернет
 # ---------------------------------------------------------------------------
-def _google(pcm: np.ndarray) -> str:
+def _google(pcm: np.ndarray, language: str) -> str:
     import speech_recognition as sr
 
     recognizer = sr.Recognizer()
     audio = sr.AudioData(pcm.tobytes(), 16000, 2)  # 2 байта на сэмпл = int16
     try:
-        return recognizer.recognize_google(audio, language=settings.stt_language)
+        return recognizer.recognize_google(audio, language=language)
     except sr.UnknownValueError:
         return ""  # разобрали не всё/шум — это нормально, просто попросим повторить
     except sr.RequestError as exc:
@@ -50,7 +50,7 @@ def _google(pcm: np.ndarray) -> str:
 # ---------------------------------------------------------------------------
 # Vosk — офлайн
 # ---------------------------------------------------------------------------
-def _vosk(pcm: np.ndarray) -> str:
+def _vosk(pcm: np.ndarray, language: str) -> str:
     global _vosk_model
     try:
         from vosk import KaldiRecognizer, Model, SetLogLevel
@@ -68,6 +68,14 @@ def _vosk(pcm: np.ndarray) -> str:
             )
         _vosk_model = Model(str(model_dir))
 
+    # Модель Vosk привязана к языку: русской моделью английскую речь не разобрать.
+    # Об этом честно предупреждаем, иначе будет казаться, что «уши сломались».
+    if language.split("-")[0] != "ru":
+        raise SttError(
+            f"Офлайн-модель Vosk загружена только для русского, а нужен {language}.\n"
+            "Для занятий английским поставьте STT_BACKEND=google или whisper."
+        )
+
     recognizer = KaldiRecognizer(_vosk_model, 16000)
     recognizer.AcceptWaveform(pcm.tobytes())
     return json.loads(recognizer.FinalResult()).get("text", "").strip()
@@ -76,7 +84,7 @@ def _vosk(pcm: np.ndarray) -> str:
 # ---------------------------------------------------------------------------
 # faster-whisper — офлайн, лучшее качество
 # ---------------------------------------------------------------------------
-def _whisper(pcm: np.ndarray) -> str:
+def _whisper(pcm: np.ndarray, language: str) -> str:
     global _whisper_model
     try:
         from faster_whisper import WhisperModel
@@ -89,7 +97,7 @@ def _whisper(pcm: np.ndarray) -> str:
 
     segments, _info = _whisper_model.transcribe(
         pcm.astype(np.float32) / 32768.0,
-        language=settings.stt_language.split("-")[0],
+        language=language.split("-")[0],
         vad_filter=True,
     )
     return " ".join(segment.text.strip() for segment in segments).strip()
@@ -98,9 +106,13 @@ def _whisper(pcm: np.ndarray) -> str:
 _BACKENDS = {"google": _google, "vosk": _vosk, "whisper": _whisper}
 
 
-def transcribe(pcm: np.ndarray) -> str:
-    """Звук (моно int16 @16 кГц) -> текст."""
+def transcribe(pcm: np.ndarray, language: str | None = None) -> str:
+    """Звук (моно int16 @16 кГц) -> текст.
+
+    Язык передаётся явно: в занятии английским распознавание переключается на
+    ходу, а ``settings.stt_language`` читается только один раз при импорте.
+    """
     backend = _BACKENDS.get(settings.stt_backend)
     if backend is None:
         raise SttError(f"Неизвестный STT_BACKEND={settings.stt_backend!r}. Доступно: {', '.join(_BACKENDS)}")
-    return backend(pcm)
+    return backend(pcm, language or settings.stt_language)

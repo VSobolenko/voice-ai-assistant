@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Тёмная тема без ActionBar: приложение выглядит как консоль -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF0D1117</item>
+        <item name="android:colorBackground">#FF0D1117</item>
+        <item name="android:statusBarColor">#FF0D1117</item>
+        <item name="android:navigationBarColor">#FF0D1117</item>
+        <item name="android:textColorPrimary">#FFC9D1D9</item>
+    </style>
+
+    <style name="LogText">
+        <item name="android:textSize">11sp</item>
+        <item name="android:textColor">#FFC9D1D9</item>
+        <item name="android:fontFamily">monospace</item>
+    </style>
+</resources>

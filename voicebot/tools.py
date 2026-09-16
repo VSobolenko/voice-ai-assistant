@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import re
@@ -51,6 +52,15 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
+
+# Ниже этого объёма считаем, что текст со страницы не извлёкся
+_MIN_CONTENT_CHARS = 200
+# Признаки баннера о cookie: его текст часто длиннее самой статьи
+_COOKIE_MARKERS = ("cookie", "куки", "согласие на обработку", "consent")
+# Столько строк в таблице намекают, что страница табличная (курсы, каталог, расписание)
+_TABLE_ROWS_HINT = 20
+# Если больше половины текста — ссылки, это меню, а не содержание
+_MAX_LINK_RATIO = 0.5
 
 # ---------------------------------------------------------------------------
 # Описание инструментов для модели (формат OpenAI / DeepSeek)
@@ -188,7 +198,8 @@ def web_search(query: str, max_results: int = 5) -> str:
             body = body[: settings.search_snippet_chars].rstrip() + "…"
         lines.append(f"{index}. {title}\n   {url}\n   {body}")
     lines.append(
-        "\nФрагменты могут быть устаревшими. Если нужна точная цифра — открой страницу через web_fetch."
+        "\nФрагменты могут быть устаревшими. Если нужна точная цифра, открой страницу через web_fetch. "
+        "Если страница не откроется — этих фрагментов достаточно для ответа."
     )
     return "\n".join(lines)
 
@@ -214,17 +225,104 @@ def _decode(raw: bytes, charset: str | None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _link_ratio(node) -> float:
+    """Доля текста, которая лежит внутри ссылок.
+
+    Если почти весь текст — ссылки, это меню или список рубрик, а не статья.
+    Так мы отсеиваем страницы, где содержание не извлеклось, а вместо него
+    пришла навигация сайта.
+    """
+    total = len(node.get_text(" ", strip=True))
+    if not total:
+        return 0.0
+    linked = sum(len(link.get_text(" ", strip=True)) for link in node.find_all("a"))
+    return linked / total
+
+
 def _html_to_text(html: str) -> str:
+    """Вытащить из HTML читаемый текст.
+
+    Раньше здесь брался первый попавшийся <main>, и это оказалось главной ошибкой:
+    на многих сайтах <main> — почти пустая обёртка, а статья лежит в блоке рядом.
+    В ответ модели уезжало «Новости Прямой эфир» вместо самой новости или меню
+    госорганов вместо текста. Поэтому теперь работаем так:
+
+      1. Основной текст — это абзацы. Складываем <p> и заголовки: они дают
+         содержание статьи и не тянут за собой меню, баннеры и подвалы.
+      2. Если у страницы табличная природа (курсы валют, каталог, расписание),
+         данные лежат в ячейках, а не в абзацах — добавляем и их.
+      3. Если текста всё ещё мало — берём контейнер, в котором его больше всего.
+      4. И только потом — весь текст страницы.
+    Плюс отбрасываем «меню вместо статьи» по доле текста внутри ссылок.
+    """
     from bs4 import BeautifulSoup
 
     soup = BeautifulSoup(html, "lxml")
-    for tag in soup(["script", "style", "noscript", "svg", "iframe", "form", "nav", "footer", "header", "aside"]):
+    for tag in soup(
+        ["script", "style", "noscript", "svg", "iframe", "form", "nav", "footer", "header", "aside", "template"]
+    ):
         tag.decompose()
 
-    # Если есть семантический контейнер — берём только его, там меньше «мусора»
-    main = soup.find("main") or soup.find("article") or soup.body or soup
-    text = " ".join(main.get_text(" ").split())
-    return text
+    def tidy(element) -> str:
+        return " ".join(element.get_text(" ", strip=True).split())
+
+    # 1. Абзацы и заголовки
+    chunks = [tidy(node) for node in soup.find_all(["h1", "h2", "h3", "p", "blockquote"])]
+    paragraphs = " ".join(chunk for chunk in chunks if chunk)
+
+    # Согласие на cookie иногда длиннее самой статьи — такую «простыню» не берём
+    if len(paragraphs) < 600 and any(marker in paragraphs.lower() for marker in _COOKIE_MARKERS):
+        paragraphs = ""
+
+    # 2. Табличные данные: на странице курсов весь смысл в ячейках
+    if len(soup.find_all("tr")) >= _TABLE_ROWS_HINT:
+        cells = " ".join(chunk for chunk in (tidy(node) for node in soup.find_all(["td", "th"])) if chunk)
+        if len(cells) > len(paragraphs):
+            paragraphs = f"{paragraphs} {cells}".strip()
+
+    # 3. Самый насыщенный текстом контейнер
+    if len(paragraphs) < _MIN_CONTENT_CHARS:
+        best = None
+        best_text = ""
+        for node in soup.find_all(["main", "article", "section", "div"]):
+            text = tidy(node)
+            if len(text) > len(best_text):
+                best, best_text = node, text
+        # Меню и списки рубрик содержанием не считаем
+        if best is not None and len(best_text) > len(paragraphs) and _link_ratio(best) < _MAX_LINK_RATIO:
+            paragraphs = best_text
+
+    # 4. Всё, что есть
+    if len(paragraphs) < _MIN_CONTENT_CHARS:
+        body = soup.body or soup
+        whole = tidy(body)
+        if len(whole) > len(paragraphs) and _link_ratio(body) < _MAX_LINK_RATIO:
+            paragraphs = whole
+
+    return paragraphs
+
+
+def _clip(text: str, limit: int) -> tuple[str, bool]:
+    """Обрезать текст по границе слова, не разрывая числа.
+
+    Наивная обрезка по символу давала «840 USD 1 Доллар США 84,2…» — то есть
+    модель видела обрывок курса вместо самой цифры. Это опаснее лишних десяти
+    символов, поэтому последний токен всегда дописываем целиком.
+    """
+    if len(text) <= limit:
+        return text, False
+
+    cut = text[:limit]
+    boundary = cut.rfind(" ")
+    if boundary < limit * 0.7:
+        return cut.rstrip(), True
+
+    # Дописываем последнее слово (или число) до конца
+    tail = text[boundary + 1 : boundary + 40]
+    end = tail.find(" ")
+    if end != -1 and tail[:end].strip():
+        boundary += 1 + end
+    return text[:boundary].rstrip(), True
 
 
 def web_fetch(url: str) -> str:
@@ -246,25 +344,38 @@ def web_fetch(url: str) -> str:
             final_url = response.geturl()
             content_type = response.headers.get_content_type()
             charset = response.headers.get_content_charset()
-            raw = response.read(settings.http_max_bytes)
+            try:
+                raw = response.read(settings.http_max_bytes)
+            except http.client.IncompleteRead as exc:
+                # Сервер оборвал соединение на середине. Раньше мы выбрасывали уже
+                # скачанное и сообщали об ошибке, хотя текст на странице был.
+                raw = exc.partial
+                print("  [сеть] соединение оборвалось, беру то, что успело прийти")
     except UnsafeUrl as exc:
         return f"Адрес отклонён: {exc}"
     except urllib.error.HTTPError as exc:
-        return f"Страница вернула ошибку {exc.code} ({exc.reason}). Открой другую ссылку."
+        return (
+            f"Страница вернула ошибку {exc.code} ({exc.reason}). "
+            "Ответь по фрагментам из поиска и не открывай этот сайт снова."
+        )
     except Exception as exc:  # noqa: BLE001
-        return f"Не удалось загрузить страницу: {type(exc).__name__}: {exc}"
+        return (
+            f"Не удалось загрузить страницу ({type(exc).__name__}). "
+            "Ответь по фрагментам из поиска и не открывай этот сайт снова."
+        )
 
     if content_type not in ("text/html", "text/plain", "application/xhtml+xml"):
         return f"Страница не текстовая (тип {content_type}), читать её не умею."
 
     html = _decode(raw, charset)
     text = html if content_type == "text/plain" else _html_to_text(html)
-    if not text:
-        return "На странице не нашлось текста — возможно, он рисуется скриптами."
+    if len(text) < _MIN_CONTENT_CHARS:
+        return (
+            "На странице не нашлось читаемого текста: похоже, он рисуется скриптами "
+            "(сайт-приложение) или закрыт от роботов. Ответь по фрагментам из поиска."
+        )
 
-    trimmed = len(text) > settings.fetch_max_chars
-    if trimmed:
-        text = text[: settings.fetch_max_chars].rstrip()
+    text, trimmed = _clip(text, settings.fetch_max_chars)
     note = "\n\n[текст обрезан, показано начало страницы]" if trimmed else ""
     return f"Содержимое {final_url}:\n{text}{note}"
 

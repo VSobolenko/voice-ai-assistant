@@ -12,6 +12,12 @@
 даже не отправлена в синтез. Поэтому диалог говорит через speak(): фразы
 синтезируются на опережение в отдельном потоке, а звук пишется в один
 непрерывный поток вывода (см. audio.OutputChannel).
+
+Вторая тонкость — язык текста. Движок читает текст по правилам **своего** языка:
+русский голос произносит английские слова русскими фонемами, и получается тот
+самый «акцент». Поэтому голос выбирается по языку текста (TTS_VOICE для русского,
+TTS_VOICE_EN для английского), а смешанная фраза режется по алфавитам — иначе
+русский голос испортил бы именно то английское слово, ради которого фраза сказана.
 """
 
 from __future__ import annotations
@@ -24,12 +30,78 @@ from contextlib import AbstractContextManager
 
 import numpy as np
 
+from . import language
 from .audio import OutputChannel, play_pcm
 from .config import settings
 
 # Конец предложения = точка/!/?/… за которым идёт пробел или конец строки.
 # Требование пробела нужно, чтобы не разрывать числа вида 2.5
 _SENTENCE_RE = re.compile(r"[.!?…]+(?=\s|$)")
+
+
+def voice_for(language_code: str | None) -> str:
+    """Голос под язык текста.
+
+    ``None`` (текст без букв: цифры, знаки) остаётся на русском голосе — цифры
+    читаются одинаково на любом языке, и менять голос из-за них незачем.
+    """
+    if language_code == language.EN:
+        return settings.tts_voice_en
+    return settings.tts_voice
+
+
+def parts_for(text: str) -> list[tuple[str | None, str]]:
+    """Разложить реплику на куски: ``[(язык, текст), ...]``.
+
+    Если голоса для русского и английского совпадают (например, выбран один
+    многоязычный голос), резать фразу незачем: один голос одинаково хорошо
+    прочитает оба языка, а лишние стыки синтеза только испортят речь.
+    """
+    if not settings.tts_mix_voices or settings.tts_voice == settings.tts_voice_en:
+        return [(language.detect(text), text)]
+    return language.split(text, settings.tts_mix_min_letters)
+
+
+def log_mixed(parts: list[tuple[str | None, str]]) -> None:
+    """Показать в консоли, что фраза ушла к разным голосам.
+
+    Без этой строки «русский акцент» нечем отлаживать на слух: слышно, что
+    английское слово прочитано неправильно, а видно только, что реплик стало
+    больше. Здесь же написано, какой голос получил какой кусок.
+    """
+    if len(parts) < 2:
+        return
+    shown = " | ".join(f"{voice_for(code)}: {chunk}" for code, chunk in parts)
+    print(f"[рот] фраза на разные голоса ({len(parts)} куска) → {shown}")
+
+
+# Тишина по краям синтеза: edge-tts добавляет около секунды «хвоста» в каждой
+# реплике. Для одного предложения это просто пауза, но когда фраза режется на
+# куски ради разных голосов, тишина приезжает с каждым куском — замерено 3
+# секунды провала на фразе длиной 3 секунды. Поэтому края подрезаем, оставляя
+# чуть-чуть: внутри фразы меньше, в конце реплики больше (там нужна пауза).
+LEAD_KEEP_MS = 20
+INNER_TAIL_MS = 90
+
+
+def trim_silence(samples: np.ndarray, rate: int, tail_ms: int) -> np.ndarray:
+    """Убрать тишину по краям, оставив небольшую паузу в конце.
+
+    Порог берём от пика, а не абсолютный: громкая запись и тихая должны
+    обрабатываться одинаково. Порог низкий, чтобы не срезать тихие согласные
+    на конце слова («…s», «…f»).
+    """
+    if samples.size == 0:
+        return samples
+    peak = int(np.abs(samples).max())
+    if peak == 0:
+        return samples
+    loud = np.where(np.abs(samples) > max(120, peak // 200))[0]
+    if loud.size == 0:
+        return samples
+    start = max(0, int(loud[0]) - int(rate * LEAD_KEEP_MS / 1000))
+    stop = min(samples.size, int(loud[-1]) + int(rate * tail_ms / 1000))
+    return samples[start:stop]
 
 
 class TtsError(RuntimeError):
@@ -128,11 +200,14 @@ class Mouth:
             print("[рот] режим TTS_BACKEND=edge: фразы, которые не удалось озвучить, будут пропущены.\n")
 
     # -- синтез ---------------------------------------------------------
-    def synthesize(self, text: str) -> tuple[np.ndarray, int]:
+    def synthesize(
+        self, text: str, voice: str | None = None, tail_ms: int | None = None
+    ) -> tuple[np.ndarray, int]:
         """Текст -> моно int16 и частота дискретизации. Только edge-tts.
 
         Отдаём именно сэмплы, а не играем сразу: это позволяет синтезировать
-        следующую фразу, пока звучит предыдущая.
+        следующую фразу, пока звучит предыдущая. Голос выбирается по языку
+        текста — иначе русский движок прочитает английский русскими фонемами.
         """
         import edge_tts
         import miniaudio
@@ -141,7 +216,9 @@ class Mouth:
             raise TtsError(self._edge_problem)
 
         async def _synth() -> bytes:
-            communicate = edge_tts.Communicate(text, settings.tts_voice, rate=settings.tts_rate)
+            communicate = edge_tts.Communicate(
+                text, voice or settings.tts_voice, rate=settings.tts_rate
+            )
             buffer = bytearray()
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
@@ -156,7 +233,8 @@ class Mouth:
         samples = np.frombuffer(decoded.samples, dtype=np.int16)
         if decoded.nchannels > 1:
             samples = samples.reshape(-1, decoded.nchannels).mean(axis=1).astype(np.int16)
-        return samples, decoded.sample_rate
+        wanted = settings.tts_tail_ms if tail_ms is None else tail_ms
+        return trim_silence(samples, decoded.sample_rate, wanted), decoded.sample_rate
 
     # -- разовая фраза --------------------------------------------------
     def say(self, text: str, on_start=None) -> None:
@@ -164,35 +242,47 @@ class Mouth:
         text = text.strip()
         if not text:
             return
-        if self.edge_available:
-            try:
-                samples, rate = self.synthesize(text)
-                play_pcm(samples, rate, on_start)
-                return
-            except Exception as exc:  # noqa: BLE001 — сеть, сервис, что угодно
-                self.note_edge_failure(exc)
-                if self.backend == "edge":
-                    return  # строгий режим: чужой голос не подставляем
-        self.say_with_sapi(text, on_start)
+        parts = parts_for(text)
+        log_mixed(parts)
+        for index, (language_code, chunk) in enumerate(parts):
+            # Внутри разрезанной фразы пауза должна быть короче, чем в конце реплики,
+            # иначе речь распадается на отдельные слова.
+            tail = settings.tts_tail_ms if index == len(parts) - 1 else INNER_TAIL_MS
+            if self.edge_available:
+                try:
+                    samples, rate = self.synthesize(chunk, voice_for(language_code), tail)
+                    play_pcm(samples, rate, on_start)
+                    continue
+                except Exception as exc:  # noqa: BLE001 — сеть, сервис, что угодно
+                    self.note_edge_failure(exc)
+                    if self.backend == "edge":
+                        return  # строгий режим: чужой голос не подставляем
+            # Нейросетевой голос отказал — договариваем системным, чтобы фраза
+            # не пропала целиком посреди предложения.
+            self.say_with_sapi(chunk, on_start, language_code)
 
-    def say_with_sapi(self, text: str, on_start=None) -> None:
+    def say_with_sapi(self, text: str, on_start=None, language_code: str | None = None) -> None:
         """Озвучить системным голосом Windows (офлайн, но робот)."""
         import pyttsx3
 
         if not self._sapi_warned:
             print("[рот] использую системный голос Windows (SAPI) — офлайн-запас.")
             self._sapi_warned = True
+        # Язык текста важен и здесь: английский голос Windows читает английский
+        # правильно, а русский на английском тексте даёт тот самый «акцент».
+        want = "en" if language_code == language.EN else "ru"
+        expected = "english" if want == "en" else "russian"
         engine = pyttsx3.init()
         target = None
         for voice in engine.getProperty("voices") or []:
-            languages = [str(l).lower() for l in (voice.languages or [])]
+            languages = [str(item).lower() for item in (voice.languages or [])]
             name = str(voice.name).lower()
-            if any("ru" in l for l in languages) or "russian" in name:
+            if any(want in item for item in languages) or expected in name:
                 target = voice.id
                 break
         if target:
             engine.setProperty("voice", target)
-        else:
+        elif want == "ru":
             print("[рот] ВНИМАНИЕ: русский голос не найден — речь будет с английским акцентом.")
         engine.setProperty("rate", self._sapi_rate())
         if on_start is not None:
@@ -252,8 +342,9 @@ class _SequentialSpeech(AbstractContextManager):
     def say(self, text: str) -> None:
         if not text.strip():
             return
-        self.speaking = True
-        self._mouth.say_with_sapi(text, self._on_start)
+        for language_code, chunk in parts_for(text):
+            self.speaking = True
+            self._mouth.say_with_sapi(chunk, self._on_start, language_code)
 
     def __exit__(self, *exc_info) -> bool:
         return False
@@ -302,8 +393,15 @@ class _PipelineSpeech(AbstractContextManager):
         if not text or self._closed or self._stopped.is_set():
             return
         self.speaking = True
-        if not self._put(self._texts, text, self._synth):
-            print("[рот] синтез остановился — фраза пропущена")
+        # Смешанную фразу кладём в очередь несколькими кусками: каждый уйдёт к
+        # своему голосу, а очередь сохранит порядок, поэтому стыка не слышно.
+        parts = parts_for(text)
+        log_mixed(parts)
+        for index, (language_code, chunk) in enumerate(parts):
+            tail = settings.tts_tail_ms if index == len(parts) - 1 else INNER_TAIL_MS
+            if not self._put(self._texts, (chunk, language_code, tail), self._synth):
+                print("[рот] синтез остановился — фраза пропущена")
+                return
 
     def __exit__(self, exc_type, exc, tb) -> bool:
         # При исключении (например, Ctrl+C) не доигрываем очередь, а обрываем речь
@@ -329,16 +427,17 @@ class _PipelineSpeech(AbstractContextManager):
     # -- потоки ----------------------------------------------------------
     def _synth_loop(self) -> None:
         while True:
-            text = self._texts.get()
-            if text is None or self._stopped.is_set():
+            item = self._texts.get()
+            if item is None or self._stopped.is_set():
                 return
+            text, language_code, tail_ms = item
             try:
-                samples, rate = self._mouth.synthesize(text)
+                samples, rate = self._mouth.synthesize(text, voice_for(language_code), tail_ms)
             except Exception as exc:  # noqa: BLE001 — сеть, сервис, что угодно
                 self._mouth.note_edge_failure(exc)
                 if self._mouth.backend == "edge":
                     continue  # строгий режим: чужой голос не подставляем
-                item = ("sapi", text)
+                item = ("sapi", text, language_code)
             else:
                 item = ("pcm", samples, rate)
             if not self._put(self._audio, item, self._play):
@@ -356,7 +455,7 @@ class _PipelineSpeech(AbstractContextManager):
                 # Синтез отказал: даём доиграть буферу и говорим системным голосом,
                 # чтобы порядок фраз не сломался
                 self._channel.drain()
-                self._mouth.say_with_sapi(item[1])
+                self._mouth.say_with_sapi(item[1], None, item[2])
             else:
                 self._channel.write(item[1], item[2])
 

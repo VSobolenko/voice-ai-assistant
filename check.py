@@ -23,12 +23,18 @@ def main() -> int:
     code = self_test()
 
     print("\n[дополнительно] доступные голоса синтеза речи")
-    try:
-        for voice in list_edge_voices():
-            print("   ", voice)
-        print("    выбранный в .env голос (TTS_VOICE) должен быть из этого списка")
-    except Exception as exc:  # noqa: BLE001
-        print(f"    не удалось получить список: {type(exc).__name__}: {exc}")
+    for prefix, setting, note in (
+        ("ru", "TTS_VOICE", "ими читается русский текст; здесь нужен русский голос"),
+        ("en", "TTS_VOICE_EN", "ими читается английский текст. Голоса Multilingual "
+                               "читают и русский, но с английским акцентом"),
+    ):
+        print(f"  {setting} — {note}:")
+        try:
+            for voice in list_edge_voices(prefix):
+                print("   ", voice)
+        except Exception as exc:  # noqa: BLE001
+            print(f"    не удалось получить список: {type(exc).__name__}: {exc}")
+    print("    выбранные голоса должны быть из этих списков; послушать их: python voices.py")
 
     print("\n[дополнительно] звуковые устройства")
     try:

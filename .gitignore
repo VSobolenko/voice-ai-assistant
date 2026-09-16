@@ -2,3 +2,20 @@
 __pycache__/
 *.pyc
 .env
+
+# Образцы голосов для прослушивания (создаёт voices.py)
+samples/
+
+# Сборка Android: ключ подписи и готовые пакеты в репозиторий не кладём
+android/build/
+android/debug.keystore
+*.apk
+*.idsig
+
+# Временные проверки и дампы интерфейса: нужны на один раз, в репозиторий не идут
+_probe_*.py
+_ui_dump.py
+_Probe*.java
+Probe*.java
+_ui.xml
+u.xml
